@@ -22,6 +22,7 @@ export { FanqieRadarSource, QidianRadarSource, TextRadarSource, type RadarSource
 export { readGenreProfile, readBookRules, listAvailableGenres, getBuiltinGenresDir } from "./agents/rules-reader.js";
 export { buildWriterSystemPrompt } from "./agents/writer-prompts.js";
 export { analyzeAITells, type AITellResult, type AITellIssue } from "./agents/ai-tells.js";
+export { analyzeSensitiveWords, type SensitiveWordResult, type SensitiveWordMatch } from "./agents/sensitive-words.js";
 export { detectAIContent, type DetectionResult } from "./agents/detector.js";
 export { analyzeStyle } from "./agents/style-analyzer.js";
 export { analyzeDetectionInsights } from "./agents/detection-insights.js";

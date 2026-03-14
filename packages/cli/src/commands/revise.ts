@@ -6,7 +6,7 @@ export const reviseCommand = new Command("revise")
   .description("Revise a chapter based on audit issues")
   .argument("[book-id]", "Book ID (auto-detected if only one book)")
   .argument("[chapter]", "Chapter number (defaults to latest)")
-  .option("--mode <mode>", "Revise mode: polish, rewrite, rework", "rewrite")
+  .option("--mode <mode>", "Revise mode: polish, rewrite, rework, spot-fix", "rewrite")
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, chapterStr: string | undefined, opts) => {
     try {

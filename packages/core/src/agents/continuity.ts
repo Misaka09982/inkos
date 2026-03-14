@@ -46,6 +46,7 @@ const DIMENSION_MAP: Record<number, string> = {
   24: "支线停滞",
   25: "弧线平坦",
   26: "节奏单调",
+  27: "敏感词检查",
 };
 
 function buildDimensionList(

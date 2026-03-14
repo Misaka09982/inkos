@@ -2,8 +2,9 @@ import { PipelineRunner } from "./runner.js";
 import type { PipelineConfig } from "./runner.js";
 import { StateManager } from "../state/manager.js";
 import type { BookConfig } from "../models/book.js";
-import type { QualityGates } from "../models/project.js";
+import type { QualityGates, DetectionConfig } from "../models/project.js";
 import { dispatchWebhookEvent } from "../notify/dispatcher.js";
+import { detectChapter, detectAndRewrite } from "./detection-runner.js";
 
 export interface SchedulerConfig extends PipelineConfig {
   readonly radarCron: string;
@@ -11,6 +12,7 @@ export interface SchedulerConfig extends PipelineConfig {
   readonly auditCron: string;
   readonly maxConcurrentBooks: number;
   readonly qualityGates?: QualityGates;
+  readonly detection?: DetectionConfig;
   readonly onChapterComplete?: (bookId: string, chapter: number, status: string) => void;
   readonly onError?: (bookId: string, error: Error) => void;
   readonly onPause?: (bookId: string, reason: string) => void;
@@ -32,6 +34,8 @@ export class Scheduler {
   // Quality gate tracking (per book)
   private consecutiveFailures = new Map<string, number>();
   private pausedBooks = new Set<string>();
+  // Failure clustering: bookId → (dimension → count)
+  private failureDimensions = new Map<string, Map<string, number>>();
 
   constructor(config: SchedulerConfig) {
     this.config = config;
@@ -89,6 +93,7 @@ export class Scheduler {
   resumeBook(bookId: string): void {
     this.pausedBooks.delete(bookId);
     this.consecutiveFailures.delete(bookId);
+    this.failureDimensions.delete(bookId);
   }
 
   /** Check if a book is paused. */
@@ -120,14 +125,46 @@ export class Scheduler {
 
     for (const book of booksToWrite) {
       try {
-        const result = await this.pipeline.writeNextChapter(book.id);
+        // Compute temperature override: base 0.7 + failures * step
+        const failures = this.consecutiveFailures.get(book.id) ?? 0;
+        const tempOverride = failures > 0
+          ? Math.min(1.2, 0.7 + failures * this.gates.retryTemperatureStep)
+          : undefined;
+
+        const result = await this.pipeline.writeNextChapter(book.id, undefined, tempOverride);
 
         if (result.status === "approved") {
           // Reset failure counter on success
           this.consecutiveFailures.delete(book.id);
+
+          // Feature #6: Auto-detection loop after successful audit
+          if (this.config.detection?.enabled) {
+            try {
+              const bookDir = this.state.bookDir(book.id);
+              const chapterContent = await this.readChapterContent(bookDir, result.chapterNumber);
+              const detResult = await detectChapter(
+                this.config.detection,
+                chapterContent,
+                result.chapterNumber,
+              );
+              if (!detResult.passed && this.config.detection.autoRewrite) {
+                await detectAndRewrite(
+                  this.config.detection,
+                  { client: this.config.client, model: this.config.model, projectRoot: this.config.projectRoot },
+                  bookDir,
+                  chapterContent,
+                  result.chapterNumber,
+                  book.config.genre,
+                );
+              }
+            } catch (e) {
+              this.config.onError?.(book.id, e as Error);
+            }
+          }
         } else {
           // Audit failed — apply quality gates
-          await this.handleAuditFailure(book.id, result.chapterNumber);
+          const issueCategories = result.auditResult.issues.map((i) => i.category);
+          await this.handleAuditFailure(book.id, result.chapterNumber, issueCategories);
         }
 
         this.config.onChapterComplete?.(
@@ -142,9 +179,29 @@ export class Scheduler {
     }
   }
 
-  private async handleAuditFailure(bookId: string, chapterNumber: number): Promise<void> {
+  private async handleAuditFailure(
+    bookId: string,
+    chapterNumber: number,
+    issueCategories: ReadonlyArray<string> = [],
+  ): Promise<void> {
     const failures = (this.consecutiveFailures.get(bookId) ?? 0) + 1;
     this.consecutiveFailures.set(bookId, failures);
+
+    // Track failure dimensions for clustering
+    if (issueCategories.length > 0) {
+      const dimMap = this.failureDimensions.get(bookId) ?? new Map<string, number>();
+      for (const cat of issueCategories) {
+        dimMap.set(cat, (dimMap.get(cat) ?? 0) + 1);
+      }
+      this.failureDimensions.set(bookId, dimMap);
+
+      // Check for dimension clustering (any dimension with >=3 failures)
+      for (const [dimension, count] of dimMap) {
+        if (count >= 3) {
+          await this.emitDiagnosticAlert(bookId, chapterNumber, dimension, count);
+        }
+      }
+    }
 
     const gates = this.gates;
 
@@ -184,6 +241,43 @@ export class Scheduler {
     } catch (e) {
       this.config.onError?.("radar", e as Error);
     }
+  }
+
+  private async emitDiagnosticAlert(
+    bookId: string,
+    chapterNumber: number,
+    dimension: string,
+    count: number,
+  ): Promise<void> {
+    process.stderr.write(
+      `[scheduler] DIAGNOSTIC: ${bookId} has ${count} failures in dimension "${dimension}"\n`,
+    );
+
+    if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {
+      await dispatchWebhookEvent(this.config.notifyChannels, {
+        event: "diagnostic-alert",
+        bookId,
+        chapterNumber: chapterNumber > 0 ? chapterNumber : undefined,
+        timestamp: new Date().toISOString(),
+        data: { dimension, failureCount: count },
+      });
+    }
+  }
+
+  private async readChapterContent(bookDir: string, chapterNumber: number): Promise<string> {
+    const { readFile, readdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const chaptersDir = join(bookDir, "chapters");
+    const files = await readdir(chaptersDir);
+    const paddedNum = String(chapterNumber).padStart(4, "0");
+    const chapterFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
+    if (!chapterFile) {
+      throw new Error(`Chapter ${chapterNumber} file not found in ${chaptersDir}`);
+    }
+    const raw = await readFile(join(chaptersDir, chapterFile), "utf-8");
+    const lines = raw.split("\n");
+    const contentStart = lines.findIndex((l, i) => i > 0 && l.trim().length > 0);
+    return contentStart >= 0 ? lines.slice(contentStart).join("\n") : raw;
   }
 
   private cronToMs(cron: string): number {

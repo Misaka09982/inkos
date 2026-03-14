@@ -13,6 +13,7 @@ export interface WriteChapterInput {
   readonly chapterNumber: number;
   readonly externalContext?: string;
   readonly wordCountOverride?: number;
+  readonly temperatureOverride?: number;
 }
 
 export interface WriteChapterOutput {
@@ -71,6 +72,9 @@ export class WriterAgent extends BaseAgent {
       book, genreProfile, bookRules, bookRulesBody, genreBody, styleGuide, styleFingerprint,
     );
 
+    const dialogueFingerprints = this.extractDialogueFingerprints(recentChapters, storyBible);
+    const relevantSummaries = this.findRelevantSummaries(chapterSummaries, volumeOutline, chapterNumber);
+
     const userPrompt = this.buildUserPrompt({
       chapterNumber,
       storyBible,
@@ -85,17 +89,31 @@ export class WriterAgent extends BaseAgent {
       subplotBoard,
       emotionalArcs,
       characterMatrix,
+      dialogueFingerprints,
+      relevantSummaries,
     });
+
+    const temperature = input.temperatureOverride ?? 0.7;
 
     const response = await this.chat(
       [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { maxTokens: 16384, temperature: 0.7 },
+      { maxTokens: 16384, temperature },
     );
 
-    return this.parseOutput(chapterNumber, response.content, genreProfile);
+    const output = this.parseOutput(chapterNumber, response.content, genreProfile);
+
+    // #4: Post-write constraint validation (regex-based, zero cost)
+    const violations = this.validateConstraints(output.content, bookRules);
+    if (violations.length > 0) {
+      process.stderr.write(
+        `[writer] Constraint violations in chapter ${chapterNumber}: ${violations.join("; ")}\n`,
+      );
+    }
+
+    return output;
   }
 
   async saveChapter(
@@ -145,6 +163,8 @@ export class WriterAgent extends BaseAgent {
     readonly subplotBoard: string;
     readonly emotionalArcs: string;
     readonly characterMatrix: string;
+    readonly dialogueFingerprints?: string;
+    readonly relevantSummaries?: string;
   }): string {
     const contextBlock = params.externalContext
       ? `\n## 外部指令\n以下是来自外部系统的创作指令，请在本章中融入：\n\n${params.externalContext}\n`
@@ -170,6 +190,14 @@ export class WriterAgent extends BaseAgent {
       ? `\n## 角色交互矩阵\n${params.characterMatrix}\n`
       : "";
 
+    const fingerprintBlock = params.dialogueFingerprints
+      ? `\n## 角色对话指纹\n${params.dialogueFingerprints}\n`
+      : "";
+
+    const relevantBlock = params.relevantSummaries
+      ? `\n## 相关历史章节摘要\n${params.relevantSummaries}\n`
+      : "";
+
     return `请续写第${params.chapterNumber}章。
 ${contextBlock}
 ## 当前状态卡
@@ -177,7 +205,7 @@ ${params.currentState}
 ${ledgerBlock}
 ## 伏笔池
 ${params.hooks}
-${summariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}
+${summariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${fingerprintBlock}${relevantBlock}
 ## 最近章节
 ${params.recentChapters || "(这是第一章，无前文)"}
 
@@ -327,6 +355,151 @@ ${params.volumeOutline}
     } catch {
       return undefined;
     }
+  }
+
+  /** Validate hard constraints against content. Returns list of violation descriptions. */
+  private validateConstraints(content: string, bookRules: BookRules | null): ReadonlyArray<string> {
+    const violations: string[] = [];
+
+    // Built-in hard constraints from writer-prompts
+    if (/不是[^，。！？\n]{0,30}[，,]?\s*而是/.test(content)) {
+      violations.push("硬性禁令：出现了「不是……而是……」句式");
+    }
+    if (content.includes("——")) {
+      violations.push("硬性禁令：出现了破折号「——」");
+    }
+
+    // Book-level prohibitions (check as substring)
+    if (bookRules?.prohibitions) {
+      for (const prohibition of bookRules.prohibitions) {
+        // Only check short prohibitions as literal patterns (long ones are descriptive)
+        if (prohibition.length <= 15 && content.includes(prohibition)) {
+          violations.push(`本书禁忌：出现了"${prohibition}"`);
+        }
+      }
+    }
+
+    return violations;
+  }
+
+  /**
+   * Extract dialogue fingerprints from recent chapters.
+   * For each character with multiple dialogue lines, compute speaking style markers.
+   */
+  private extractDialogueFingerprints(recentChapters: string, _storyBible: string): string {
+    if (!recentChapters) return "";
+
+    // Match dialogue patterns: "speaker said" or dialogue in quotes
+    // Chinese dialogue typically uses "" or 「」
+    const dialogueRegex = /(?:(.{1,6})(?:说道|道|喝道|冷声道|笑道|怒道|低声道|大声道|喝骂道|冷笑道|沉声道|喊道|叫道|问道|答道)\s*[：:]\s*["""「]([^"""」]+)["""」])|["""「]([^"""」]{2,})["""」]/g;
+
+    const characterDialogues = new Map<string, string[]>();
+    let match: RegExpExecArray | null;
+
+    while ((match = dialogueRegex.exec(recentChapters)) !== null) {
+      const speaker = match[1]?.trim();
+      const line = match[2] ?? match[3] ?? "";
+      if (speaker && line.length > 1) {
+        const existing = characterDialogues.get(speaker) ?? [];
+        characterDialogues.set(speaker, [...existing, line]);
+      }
+    }
+
+    // Only include characters with >=2 dialogue lines
+    const fingerprints: string[] = [];
+    for (const [character, lines] of characterDialogues) {
+      if (lines.length < 2) continue;
+
+      const avgLen = Math.round(lines.reduce((sum, l) => sum + l.length, 0) / lines.length);
+      const isShort = avgLen < 15;
+
+      // Find frequent words/phrases (2+ occurrences)
+      const wordCounts = new Map<string, number>();
+      for (const line of lines) {
+        // Extract 2-3 char segments as "words"
+        for (let i = 0; i < line.length - 1; i++) {
+          const bigram = line.slice(i, i + 2);
+          wordCounts.set(bigram, (wordCounts.get(bigram) ?? 0) + 1);
+        }
+      }
+      const frequentWords = [...wordCounts.entries()]
+        .filter(([, count]) => count >= 2)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([w]) => `「${w}」`);
+
+      // Detect style markers
+      const markers: string[] = [];
+      if (isShort) markers.push("短句为主");
+      else markers.push("长句为主");
+
+      const questionCount = lines.filter((l) => l.includes("？") || l.includes("?")).length;
+      if (questionCount > lines.length * 0.3) markers.push("反问多");
+
+      if (frequentWords.length > 0) markers.push(`常用${frequentWords.join("")}`);
+
+      fingerprints.push(`${character}：${markers.join("，")}`);
+    }
+
+    return fingerprints.length > 0 ? fingerprints.join("；") : "";
+  }
+
+  /**
+   * Find relevant chapter summaries based on volume outline context.
+   * Extracts character names and hook IDs from the current volume's outline,
+   * then searches chapter summaries for matching entries.
+   */
+  private findRelevantSummaries(
+    chapterSummaries: string,
+    volumeOutline: string,
+    chapterNumber: number,
+  ): string {
+    if (!chapterSummaries || chapterSummaries === "(文件尚未创建)") return "";
+    if (!volumeOutline || volumeOutline === "(文件尚未创建)") return "";
+
+    // Extract character names from volume outline (Chinese name patterns)
+    const nameRegex = /[\u4e00-\u9fff]{2,4}(?=[，、。：]|$)/g;
+    const outlineNames = new Set<string>();
+    let nameMatch: RegExpExecArray | null;
+    while ((nameMatch = nameRegex.exec(volumeOutline)) !== null) {
+      outlineNames.add(nameMatch[0]);
+    }
+
+    // Extract hook IDs from volume outline
+    const hookRegex = /H\d{2,}/g;
+    const hookIds = new Set<string>();
+    let hookMatch: RegExpExecArray | null;
+    while ((hookMatch = hookRegex.exec(volumeOutline)) !== null) {
+      hookIds.add(hookMatch[0]);
+    }
+
+    if (outlineNames.size === 0 && hookIds.size === 0) return "";
+
+    // Search chapter summaries for matching rows
+    const rows = chapterSummaries.split("\n").filter((line) =>
+      line.startsWith("|") && !line.startsWith("| 章节") && !line.startsWith("|--") && !line.startsWith("| -"),
+    );
+
+    const matchedRows = rows.filter((row) => {
+      for (const name of outlineNames) {
+        if (row.includes(name)) return true;
+      }
+      for (const hookId of hookIds) {
+        if (row.includes(hookId)) return true;
+      }
+      return false;
+    });
+
+    // Skip rows for the current chapter and recent chapters (they're already in context)
+    const recentCutoff = Math.max(1, chapterNumber - 3);
+    const filteredRows = matchedRows.filter((row) => {
+      const chNumMatch = row.match(/\|\s*(\d+)\s*\|/);
+      if (!chNumMatch) return true;
+      const num = parseInt(chNumMatch[1]!, 10);
+      return num < recentCutoff;
+    });
+
+    return filteredRows.length > 0 ? filteredRows.join("\n") : "";
   }
 
   private sanitizeFilename(title: string): string {

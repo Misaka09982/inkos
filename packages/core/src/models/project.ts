@@ -63,6 +63,7 @@ export const ProjectConfigSchema = z.object({
   llm: LLMConfigSchema,
   notify: z.array(NotifyChannelSchema).default([]),
   detection: DetectionConfigSchema.optional(),
+  modelOverrides: z.record(z.string(), z.string()).optional(),
   daemon: z.object({
     schedule: z.object({
       radarCron: z.string().default("0 9 * * *"),

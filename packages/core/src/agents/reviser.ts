@@ -6,7 +6,7 @@ import { readGenreProfile, readBookRules } from "./rules-reader.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export type ReviseMode = "polish" | "rewrite" | "rework" | "anti-detect";
+export type ReviseMode = "polish" | "rewrite" | "rework" | "anti-detect" | "spot-fix";
 
 export interface ReviseOutput {
   readonly revisedContent: string;
@@ -22,6 +22,7 @@ const MODE_DESCRIPTIONS: Record<ReviseMode, string> = {
   rewrite: "改写：可改叙述顺序、画面、力度，但保留核心事实与人物动机",
   rework: "重写：可重构场景推进和冲突组织，但不改主设定和大事件结果",
   "anti-detect": "反检测改写：在保持剧情不变的前提下，降低AI生成可检测性。手法包括：增加段落长度差异、打破句式规律、用口语化/个性化表达替代书面套话、加入非对称修辞、随机化过渡方式",
+  "spot-fix": "定点修复：只修改审稿意见指出的具体句子或段落，其余所有内容必须原封不动保留。修改范围限定在问题句子及其前后各一句。禁止改动无关段落",
 };
 
 export class ReviserAgent extends BaseAgent {
@@ -114,12 +115,14 @@ ${styleGuide}
 ## 待修正章节
 ${chapterContent}`;
 
+    const maxTokens = mode === "spot-fix" ? 8192 : 16384;
+
     const response = await this.chat(
       [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { temperature: 0.3, maxTokens: 16384 },
+      { temperature: 0.3, maxTokens },
     );
 
     return this.parseOutput(response.content, gp);

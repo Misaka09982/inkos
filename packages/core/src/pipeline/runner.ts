@@ -11,6 +11,7 @@ import { RadarAgent } from "../agents/radar.js";
 import type { RadarSource } from "../agents/radar-source.js";
 import { readGenreProfile } from "../agents/rules-reader.js";
 import { analyzeAITells } from "../agents/ai-tells.js";
+import { analyzeSensitiveWords } from "../agents/sensitive-words.js";
 import { StateManager } from "../state/manager.js";
 import { dispatchNotification, dispatchWebhookEvent } from "../notify/dispatcher.js";
 import type { WebhookEvent } from "../notify/webhook.js";
@@ -27,6 +28,7 @@ export interface PipelineConfig {
   readonly notifyChannels?: ReadonlyArray<NotifyChannel>;
   readonly radarSources?: ReadonlyArray<RadarSource>;
   readonly externalContext?: string;
+  readonly modelOverrides?: Record<string, string>;
 }
 
 export interface ChapterPipelineResult {
@@ -91,6 +93,19 @@ export class PipelineRunner {
     };
   }
 
+  private modelFor(agentName: string): string {
+    return this.config.modelOverrides?.[agentName] ?? this.config.model;
+  }
+
+  private agentCtxFor(agent: string, bookId?: string): AgentContext {
+    return {
+      client: this.config.client,
+      model: this.modelFor(agent),
+      projectRoot: this.config.projectRoot,
+      bookId,
+    };
+  }
+
   private async loadGenreProfile(genre: string): Promise<{ profile: GenreProfile }> {
     const parsed = await readGenreProfile(this.config.projectRoot, genre);
     return { profile: parsed.profile };
@@ -101,12 +116,12 @@ export class PipelineRunner {
   // ---------------------------------------------------------------------------
 
   async runRadar(): Promise<RadarResult> {
-    const radar = new RadarAgent(this.agentCtx(), this.config.radarSources);
+    const radar = new RadarAgent(this.agentCtxFor("radar"), this.config.radarSources);
     return radar.scan();
   }
 
   async initBook(book: BookConfig): Promise<void> {
-    const architect = new ArchitectAgent(this.agentCtx(book.id));
+    const architect = new ArchitectAgent(this.agentCtxFor("architect", book.id));
     const bookDir = this.state.bookDir(book.id);
 
     await this.state.saveBookConfig(book.id, book);
@@ -127,7 +142,7 @@ export class PipelineRunner {
 
       const { profile: gp } = await this.loadGenreProfile(book.genre);
 
-      const writer = new WriterAgent(this.agentCtx(bookId));
+      const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
       const output = await writer.writeChapter({
         book,
         bookDir,
@@ -187,17 +202,21 @@ export class PipelineRunner {
     }
 
     const content = await this.readChapterContent(bookDir, targetChapter);
-    const auditor = new ContinuityAuditor(this.agentCtx(bookId));
+    const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
     const llmResult = await auditor.auditChapter(bookDir, content, targetChapter, book.genre);
 
     // Merge rule-based AI-tell detection
     const aiTells = analyzeAITells(content);
+    // Merge sensitive word detection
+    const sensitiveResult = analyzeSensitiveWords(content);
+    const hasBlockedWords = sensitiveResult.found.some((f) => f.severity === "block");
     const mergedIssues: ReadonlyArray<AuditIssue> = [
       ...llmResult.issues,
       ...aiTells.issues,
+      ...sensitiveResult.issues,
     ];
     const result: AuditResult = {
-      passed: llmResult.passed,
+      passed: hasBlockedWords ? false : llmResult.passed,
       issues: mergedIssues,
       summary: llmResult.summary,
     };
@@ -246,7 +265,7 @@ export class PipelineRunner {
 
       // Re-audit to get structured issues (index only stores strings)
       const content = await this.readChapterContent(bookDir, targetChapter);
-      const auditor = new ContinuityAuditor(this.agentCtx(bookId));
+      const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
       const auditResult = await auditor.auditChapter(bookDir, content, targetChapter, book.genre);
 
       if (auditResult.passed) {
@@ -255,7 +274,7 @@ export class PipelineRunner {
 
       const { profile: gp } = await this.loadGenreProfile(book.genre);
 
-      const reviser = new ReviserAgent(this.agentCtx(bookId));
+      const reviser = new ReviserAgent(this.agentCtxFor("reviser", bookId));
       const reviseOutput = await reviser.reviseChapter(
         bookDir, content, targetChapter, auditResult.issues, mode, book.genre,
       );
@@ -369,33 +388,34 @@ export class PipelineRunner {
   // Full pipeline (convenience — runs draft + audit + revise in one shot)
   // ---------------------------------------------------------------------------
 
-  async writeNextChapter(bookId: string, wordCount?: number): Promise<ChapterPipelineResult> {
+  async writeNextChapter(bookId: string, wordCount?: number, temperatureOverride?: number): Promise<ChapterPipelineResult> {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
-      return await this._writeNextChapterLocked(bookId, wordCount);
+      return await this._writeNextChapterLocked(bookId, wordCount, temperatureOverride);
     } finally {
       await releaseLock();
     }
   }
 
-  private async _writeNextChapterLocked(bookId: string, wordCount?: number): Promise<ChapterPipelineResult> {
+  private async _writeNextChapterLocked(bookId: string, wordCount?: number, temperatureOverride?: number): Promise<ChapterPipelineResult> {
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const { profile: gp } = await this.loadGenreProfile(book.genre);
 
     // 1. Write chapter
-    const writer = new WriterAgent(this.agentCtx(bookId));
+    const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
     const output = await writer.writeChapter({
       book,
       bookDir,
       chapterNumber,
       externalContext: this.config.externalContext,
       ...(wordCount ? { wordCountOverride: wordCount } : {}),
+      ...(temperatureOverride ? { temperatureOverride } : {}),
     });
 
     // 2. Audit chapter
-    const auditor = new ContinuityAuditor(this.agentCtx(bookId));
+    const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
     const llmAudit = await auditor.auditChapter(
       bookDir,
       output.content,
@@ -403,9 +423,11 @@ export class PipelineRunner {
       book.genre,
     );
     const aiTellsResult = analyzeAITells(output.content);
+    const sensitiveWriteResult = analyzeSensitiveWords(output.content);
+    const hasBlockedWriteWords = sensitiveWriteResult.found.some((f) => f.severity === "block");
     let auditResult: AuditResult = {
-      passed: llmAudit.passed,
-      issues: [...llmAudit.issues, ...aiTellsResult.issues],
+      passed: hasBlockedWriteWords ? false : llmAudit.passed,
+      issues: [...llmAudit.issues, ...aiTellsResult.issues, ...sensitiveWriteResult.issues],
       summary: llmAudit.summary,
     };
 
@@ -419,7 +441,7 @@ export class PipelineRunner {
         (i) => i.severity === "critical",
       );
       if (criticalIssues.length > 0) {
-        const reviser = new ReviserAgent(this.agentCtx(bookId));
+        const reviser = new ReviserAgent(this.agentCtxFor("reviser", bookId));
         const reviseOutput = await reviser.reviseChapter(
           bookDir,
           output.content,
@@ -442,9 +464,11 @@ export class PipelineRunner {
             book.genre,
           );
           const reAITells = analyzeAITells(finalContent);
+          const reSensitive = analyzeSensitiveWords(finalContent);
+          const reHasBlocked = reSensitive.found.some((f) => f.severity === "block");
           auditResult = {
-            passed: reAudit.passed,
-            issues: [...reAudit.issues, ...reAITells.issues],
+            passed: reHasBlocked ? false : reAudit.passed,
+            issues: [...reAudit.issues, ...reAITells.issues, ...reSensitive.issues],
             summary: reAudit.summary,
           };
 

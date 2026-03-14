@@ -38,6 +38,7 @@ export const upCommand = new Command("up")
         model: config.llm.model,
         projectRoot: root,
         notifyChannels: config.notify,
+        modelOverrides: config.modelOverrides,
         radarCron: config.daemon.schedule.radarCron,
         writeCron: config.daemon.schedule.writeCron,
         auditCron: config.daemon.schedule.auditCron,
